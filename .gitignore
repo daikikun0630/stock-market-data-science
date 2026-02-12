@@ -48,6 +48,11 @@ Thumbs.db
 *.parquet
 data/
 
+# Node.js
+node_modules/
+.next/
+out/
+
 # Logs
 *.log
 logs/

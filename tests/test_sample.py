@@ -1,105 +1,87 @@
 # 自分が買っている株(レザーテック銘柄)の株価を予測するコード
 # ボラティリティが非常に高く、短期的な価格変動が激しいくテクニカル分析が有効な銘柄であるため、過去の価格データを基に将来の株価を予測するモデルを構築 
 
-import yfinance as yf # Yahoo Financeから株価データを取得
-import pandas as pd # データ操作用ライブラリ 
-import numpy as np # 数値計算用ライブラリ
+import yfinance as yf # Yahoo Financeからデータ取得
+import pandas as pd # データ操作
+import numpy as np # 数値計算
 from sklearn.linear_model import LinearRegression # 線形回帰モデル
+from scipy.stats import norm # 正規分布
 
 # 1. データ取得
-# 作成日時が2026年2月8日（日曜日）なので2月6日までのデータを取得
 df = yf.download(
-    "6920.T", # レザーテック銘柄(東証プライム市場)
+    "6920.T",
     start="2025-02-01",
     end="2026-02-06",
     auto_adjust=True,
     progress=False
-)# レザーテック社の株価データを取得
+) # レザーテックの株価データ取得
 
-# 2. 特徴量作成
-df["return"] = df["Close"].pct_change() #日次リターン
+# 2. 特徴量 & 目的変数作成
+# 対数リターン
+df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
 
-df["ma_5"] = df["Close"].rolling(5).mean() #5日移動平均(5営業日=約1週間)
-
-df["ma_20"] = df["Close"].rolling(20).mean() #20日移動平均(20営業日=約1ヶ月)
-df["volatility"] = df["return"].rolling(20).std() #標準偏差により20日間のボラティリティを算出
-
-df = df.dropna() # 欠損値を含む行を削除
-
-# 3. 学習データ作成
+# Zスコア
 df["z_score_20"] = (
     (df["Close"] - df["Close"].rolling(20).mean()) /
     df["Close"].rolling(20).std()
-) # 20日間のZスコア
+)
 
-df["var_20"] = df["log_return"].rolling(20).var() # 20日間の分散
-df["return_lag1"] = df["log_return"].shift(1) # 1日遅れの対数リターン
+# 20日分散（リターン）
+df["var_20"] = df["log_return"].rolling(20).var()
 
-df = df.dropna() # 欠損値を含む行を削除
+# 1日ラグ
+df["return_lag1"] = df["log_return"].shift(1)
 
-x = df[["z_score_20", "var_20", "return_lag1"]] # 説明変数
+# 目的変数（1日先リターン）
+df["target"] = df["log_return"].shift(-1)
 
-# 最初X = df[["ma_5", "ma_20", "volatility"]]を説明変数にしていたが、予測精度が低かったため上記の特徴量に変更
-# 価格予測モデルではなく、確率予測モデルに近い形に変更
+# 最後に1回だけ欠損削除
+df = df.dropna()
 
-df["log_return"] = np.log(df["Close"] / df["Close"].shift(1)) # 対数リターンを計算
-df["target"] = df["log_return"].shift(-1) # 次の日の対数リターンを目的変数に設定
+# 説明変数・目的変数
+X = df[["z_score_20", "var_20", "return_lag1"]]
+y = df["target"]
 
-df = df.dropna() # 欠損値を含む行を削除
+print("X shape:", X.shape)
+print("y shape:", y.shape)
 
-y = df["target"] # 目的変数
+# 3. モデル学習
+model = LinearRegression() # 線形回帰モデル
+model.fit(X, y) # モデル学習
 
-#最初y = df["Close"]を目的変数にしていたが、予測精度が低かったため上記の特徴量に変更
-# 価格予測モデルではなく、確率予測モデルに近い形に変更
+mu_hat = model.predict(X) # 予測リターン
 
-model = LinearRegression() # 線形回帰モデルのインスタンス化
-model.fit(x, y) # モデルの学習
+# 残差
+residuals = y.values - mu_hat # 実測値 - 予測値
+sigma_hat = residuals.std() # 残差の標準偏差
 
-# 4. 2026年3月以降を予測
+print("残差標準偏差:", sigma_hat)
 
-last_date = df.index[-1] # 最終日付
-future_days = 22  # 約1ヶ月分（営業日）
-
-future_prices = [] # 予測価格を格納するリスト
-current_df = df.copy() # 予測用にデータフレームをコピー
-
-model = LinearRegression() # 線形回帰モデルのインスタンス化
-model.fit(x, y) # モデルの学習
-
-mu_hat = model.predict(x) # 学習データに対する予測値
-residuals = y - mu_hat # 残差を計算
-sigma_hat = residuals.std() # 残差の標準偏差を計算
-
-from scipy.stats import norm # 正規分布を扱うためのライブラリ
-
-latest_x = x.iloc[-1].values.reshape(1, -1) # 最新の特徴量データ
-mu_next = model.predict(latest_x)[0]    # 次の日の対数リターンの予測値
+# 4. 未来22営業日モンテカルロ予測
+future_days = 22 # 1ヶ月(22営業日)先まで予測
+n_sim = 10000 # シミュレーション数
 
 current_price = df["Close"].iloc[-1] # 最新の株価
+latest_X = X.iloc[-1].values.reshape(1, -1) # 最新の説明変数
 
-# リターン分布
-r_dist = norm(loc=mu_next, scale=sigma_hat)
+# 次期リターンの期待値
+mu_next = model.predict(latest_X)[0]
 
-# 価格分布（モンテカルロ）
-price_samples = current_price * np.exp(r_dist.rvs(size=10000))
+# モンテカルロパス生成
+simulated_paths = []
+
+for _ in range(n_sim):
+    price = current_price # シミュレーションごとに初期価格を設定
+    for _ in range(future_days):
+        r = np.random.normal(mu_next, sigma_hat) # 正規分布からリターンをサンプリング
+        price *= np.exp(r) # 株価更新
+    simulated_paths.append(price) # 1ヶ月後の価格を保存
+
+simulated_paths = np.array(simulated_paths) # シミュレーション結果を配列に変換
 
 # 5. 結果表示
-
-future_index = pd.date_range(
-    start=last_date + pd.Timedelta(days=1),
-    periods=future_days,
-    freq="B"
-) # 営業日ベースの日付インデックスを作成
-
-forecast_df = pd.DataFrame(
-    {"Predicted_Close": future_prices},
-    index=future_index
-) # 予測結果のデータフレームを作成
-
-print(forecast_df) # 予測結果を表示
-
-print("期待価格:", price_samples.mean()) # 期待価格を表示
-print("中央値:", np.median(price_samples)) # 中央値を表示
+print("---- 1ヶ月後予測分布 ----")
+print("期待価格:", simulated_paths.mean())
+print("中央値:", np.median(simulated_paths))
 print("95%信頼区間:",
-      np.percentile(price_samples, [2.5, 97.5])) # 95%信頼区間を表示
-
+      np.percentile(simulated_paths, [2.5, 97.5]))
